@@ -241,6 +241,7 @@ fastify.register(async (fastify) => {
                 headers: { 'xi-api-key': ELEVEN_API_KEY }
             });
             elevenWs = elWs;
+            // Set TTS as playing BEFORE we start the connection
             ttsPlaying = true;
             ttsCarry = Buffer.alloc(0);
             
@@ -485,6 +486,15 @@ fastify.register(async (fastify) => {
             
             // No more complex intervals - clean audio handling
         });
+        
+        // Add a welcome message when the session is ready
+        const sendWelcomeMessage = () => {
+            console.log('=== SENDING WELCOME MESSAGE ===');
+            const welcomeText = "Hello! I'm Sam, your virtual sales representative. How may I help you today?";
+            console.log('Welcome text:', welcomeText);
+            speakWithEleven(welcomeText);
+        };
+
         // Listen for messages from the OpenAI WebSocket (and send to Twilio if necessary)
         openAiWs.on('message', (data) => {
             try {
@@ -504,6 +514,10 @@ fastify.register(async (fastify) => {
                     console.log('Session details:', response);
                     // NOTE: Don't reset buffer here - let it accumulate for the first audio commit
                     console.log('Audio buffer preserved for first audio commit');
+                    
+                    // Send welcome message now that the session is ready
+                    console.log('=== SESSION READY - SENDING WELCOME MESSAGE ===');
+                    setTimeout(sendWelcomeMessage, 500); // Small delay to ensure everything is set up
                 }
                 
                 // Also handle session.created but don't set ready yet - wait for our update
