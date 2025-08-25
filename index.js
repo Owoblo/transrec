@@ -66,10 +66,13 @@ fastify.all('/incoming-call', async (request, reply) => {
   reply.type('text/xml').send(twimlResponse);
 });
 
-// Media stream bridge
+// WebSocket route for media-stream
 fastify.register(async (fastify) => {
   fastify.get('/media-stream', { websocket: true }, (connection, req) => {
     console.log('Client connected');
+
+    // Normalize Twilio WS (SocketStream.socket OR bare ws)
+    const twilioWs = connection.socket ?? connection;
 
     // ----- OpenAI Realtime (TEXT OUT only) -----
     const openAiWs = new WebSocket(
@@ -77,7 +80,6 @@ fastify.register(async (fastify) => {
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
     );
 
-    // State
     let streamSid = null;
     let openaiReady = false;
 
@@ -87,11 +89,14 @@ fastify.register(async (fastify) => {
     let ttsCarry = Buffer.alloc(0);
 
     // Inbound audio buffer (for commits)
+    const FRAME_BYTES = 160;
+    const MIN_FRAMES_TO_COMMIT = 6;
+    const SILENCE_MS = 400;
     let bytesBuffered = 0;
     let collecting = false;
     let silenceTimer = null;
 
-    const setAudioBuffer = (newVal) => { bytesBuffered = newVal; };
+    const setAudioBuffer = (v) => { bytesBuffered = v; };
 
     function stopTTS() {
       ttsPlaying = false;
@@ -100,23 +105,18 @@ fastify.register(async (fastify) => {
       elevenWs = null;
     }
 
-    // Speak via ElevenLabs (μ-law 8kHz streaming → Twilio)
     function speakWithEleven(text, attempt = 0) {
       if (!text || !text.trim()) return;
 
-      // Don’t speak before Twilio stream is ready
-      if (!streamSid || connection.socket.readyState !== WebSocket.OPEN) {
-        if (attempt < 20) { // retry for up to ~2s
-          return setTimeout(() => speakWithEleven(text, attempt + 1), 100);
-        }
+      // Don't speak before Twilio stream is ready
+      if (!streamSid || !twilioWs || twilioWs.readyState !== WebSocket.OPEN) {
+        if (attempt < 20) return setTimeout(() => speakWithEleven(text, attempt + 1), 100);
         console.warn('No streamSid or Twilio WS not open; skipping TTS.');
         return;
       }
 
-      // Prevent overlap; barge-in will call stopTTS()
       if (ttsPlaying) return;
 
-      // fresh TTS connection per utterance
       if (elevenWs && elevenWs.readyState === WebSocket.OPEN) {
         try { elevenWs.close(); } catch {}
       }
@@ -126,7 +126,7 @@ fastify.register(async (fastify) => {
       ttsPlaying = true;
       ttsCarry = Buffer.alloc(0);
 
-      const onOpen = () => {
+      elevenWs.on('open', () => {
         const payload = {
           text,
           model_id: ELEVEN_MODEL_ID || 'eleven_turbo_v2',
@@ -136,33 +136,19 @@ fastify.register(async (fastify) => {
             similarity_boost: 0.75,
             style: 0.0,
             use_speaker_boost: true
-          },
-          // Add later if you want to shave latency:
-          // optimize_streaming_latency: 3
+          }
         };
-        try { elevenWs.send(JSON.stringify(payload)); }
-        catch (e) { console.error('EL send failed', e); stopTTS(); }
-      };
+        try { elevenWs.send(JSON.stringify(payload)); } catch (e) { console.error('EL send failed', e); stopTTS(); }
+      });
 
-      const onMessage = (chunk) => {
-        // JSON control vs binary audio
+      elevenWs.on('message', (chunk) => {
         if (typeof chunk === 'string') {
           try {
             const msg = JSON.parse(chunk);
-            if (msg.type === 'error') {
-              console.error('ElevenLabs error:', msg);
-              stopTTS();
-              return;
-            }
-            if (msg.type === 'audio_stream_end') {
-              stopTTS();
-              return;
-            }
-            // ignore other JSON controls
+            if (msg.type === 'error') { console.error('ElevenLabs error:', msg); stopTTS(); return; }
+            if (msg.type === 'audio_stream_end') { stopTTS(); return; }
             return;
-          } catch {
-            // fallthrough if EL sometimes sends non-JSON text
-          }
+          } catch { /* ignore non-JSON text */ }
         }
 
         // Binary μ-law audio; frame at 20ms (160 bytes)
@@ -171,9 +157,9 @@ fastify.register(async (fastify) => {
         ttsCarry = leftover;
 
         for (const frame of frames) {
-          if (!ttsPlaying || connection.socket.readyState !== WebSocket.OPEN || !streamSid) break;
+          if (!ttsPlaying || !twilioWs || twilioWs.readyState !== WebSocket.OPEN || !streamSid) break;
           try {
-            connection.socket.send(JSON.stringify({
+            twilioWs.send(JSON.stringify({
               event: 'media',
               streamSid,
               media: { payload: frame.toString('base64') }
@@ -184,18 +170,13 @@ fastify.register(async (fastify) => {
             break;
           }
         }
-      };
+      });
 
-      const onClose = () => stopTTS();
-      const onError = (e) => { console.error('ElevenLabs WS error:', e.message); stopTTS(); };
-
-      elevenWs.on('open', onOpen);
-      elevenWs.on('message', onMessage);
-      elevenWs.on('close', onClose);
-      elevenWs.on('error', onError);
+      const cleanup = () => stopTTS();
+      elevenWs.on('close', cleanup);
+      elevenWs.on('error', (e) => { console.error('ElevenLabs WS error:', e.message); cleanup(); });
     }
 
-    // Commit current audio & ASK the model to respond (manual turns)
     function commitAudioBuffer() {
       if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
       const frames = Math.floor(bytesBuffered / FRAME_BYTES);
@@ -203,30 +184,26 @@ fastify.register(async (fastify) => {
       if (openAiWs.readyState !== WebSocket.OPEN || !openaiReady) return;
 
       try {
-        // 1) finalize input
         openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-        // 2) explicitly request a reply
         openAiWs.send(JSON.stringify({ type: 'response.create' }));
-        // Do NOT reset buffer here; wait for input_audio_buffer.committed
       } catch (e) {
         console.error('commit/response.create failed:', e);
       }
     }
 
-    // ---------- OpenAI session ----------
     const sendSessionUpdate = () => {
       const sessionUpdate = {
         type: 'session.update',
         session: {
           model: 'gpt-4o-realtime-preview-2024-10-01',
-          modalities: ['text'],             // we only want text out
-          input_audio_format: 'g711_ulaw',  // Twilio sends μ-law
+          modalities: ['text'],
+          input_audio_format: 'g711_ulaw',
           turn_detection: {
             type: 'server_vad',
             threshold: 0.55,
             prefix_padding_ms: 200,
             silence_duration_ms: SILENCE_MS,
-            create_response: false,         // we control turns; we send response.create
+            create_response: false,
             interrupt_response: true
           },
           max_response_output_tokens: 120,
@@ -243,9 +220,9 @@ fastify.register(async (fastify) => {
 
     // Welcome once BOTH OpenAI is ready and Twilio streamSid exists
     const tryWelcome = (attempt = 0) => {
-      if (openaiReady && streamSid && connection.socket.readyState === WebSocket.OPEN) {
+      if (openaiReady && streamSid && twilioWs && twilioWs.readyState === WebSocket.OPEN) {
         speakWithEleven("Hi, Saturn Star Movers—this is our virtual sales rep. How can I help today?");
-      } else if (attempt < 40) {
+      } else if (attempt < 20) {
         setTimeout(() => tryWelcome(attempt + 1), 100);
       }
     };
@@ -256,81 +233,58 @@ fastify.register(async (fastify) => {
       let evt;
       try { evt = JSON.parse(raw); } catch { return; }
 
-      // Debug essential events
-      if (evt.type === 'error' || evt.error) {
-        console.error('OpenAI error:', evt.error || evt);
-      }
+      if (evt.type === 'error' || evt.error) console.error('OpenAI error:', evt.error || evt);
 
       if (evt.type === 'session.updated') {
         openaiReady = true;
-        tryWelcome(); // will wait for streamSid if needed
+        tryWelcome();
       }
 
-      // Streamed deltas (optional to use)
       if (evt.type === 'response.output_text.delta' && evt.delta) {
         textBuffer += evt.delta;
       }
 
-      // Audio buffer lifecycle
       if (evt.type === 'input_audio_buffer.committed') {
-        // Now safe to reset our local buffer for next turn
         setAudioBuffer(0);
         collecting = false;
       }
 
-      // Final/Done → extract full text and speak
       if (evt.type === 'response.completed' || evt.type === 'response.done') {
-        // Prefer structured output if present
         const fullText = (evt.response?.output || [])
           .filter(p => p.type === 'output_text')
           .map(p => p.text)
           .join(' ')
           .trim();
-
         const toSpeak = fullText || textBuffer.trim();
         textBuffer = '';
-
         if (toSpeak) speakWithEleven(toSpeak);
       }
     });
 
-    openAiWs.on('close', (c, r) => {
-      console.log('OpenAI WS closed', c, r?.toString());
-    });
-    openAiWs.on('error', (e) => {
-      console.error('OpenAI WS error:', e.message);
-    });
+    openAiWs.on('close', (c, r) => { console.log('OpenAI WS closed', c, r?.toString()); });
+    openAiWs.on('error', (e) => { console.error('OpenAI WS error:', e.message); });
 
     // ---------- Twilio media ----------
-    connection.on('message', (message) => {
+    twilioWs.on('message', (message) => {
       try {
         const data = JSON.parse(message);
-
         switch (data.event) {
           case 'start':
             streamSid = data.start.streamSid;
             console.log('Incoming stream started', streamSid);
-            // If OpenAI is already ready, try welcome now
             tryWelcome();
             break;
 
           case 'media': {
-            // barge-in: stop TTS if caller talks
-            if (ttsPlaying) stopTTS();
-
+            if (ttsPlaying) stopTTS(); // barge-in
             if (openAiWs.readyState === WebSocket.OPEN && openaiReady) {
-              // forward audio chunk to OpenAI
               openAiWs.send(JSON.stringify({
                 type: 'input_audio_buffer.append',
                 audio: data.media.payload
               }));
-
-              // Track bytes for commit threshold
               const rawLen = Buffer.from(data.media.payload, 'base64').length;
               if (!collecting) collecting = true;
               setAudioBuffer(bytesBuffered + rawLen);
-
-              // silence timer: when no new audio arrives for N ms → commit & request response
               if (silenceTimer) clearTimeout(silenceTimer);
               silenceTimer = setTimeout(() => commitAudioBuffer(), SILENCE_MS);
             }
@@ -350,20 +304,23 @@ fastify.register(async (fastify) => {
       }
     });
 
-    connection.on('close', () => {
+    twilioWs.on('close', () => {
       if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
       if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
       stopTTS();
       console.log('Client disconnected.');
     });
 
-    connection.on('error', (e) => {
+    twilioWs.on('error', (e) => {
       console.error('Twilio WS error:', e.message);
     });
   });
 });
 
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
-  if (err) { console.error(err); process.exit(1); }
-  console.log(`Server is listening on 0.0.0.0:${PORT}`);
+    if (err) {
+        console.error(err);
+        process.exit(1);
+    }
+    console.log(`Server is listening on 0.0.0.0:${PORT}`);
 });
