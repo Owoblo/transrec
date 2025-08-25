@@ -32,7 +32,7 @@ const PORT = process.env.PORT || 5050; // Allow dynamic port assignment
 
 // ElevenLabs configuration
 const ELEVEN_STREAM_URL = (voiceId) =>
-  `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`;
+  `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input`;
 
 // VAD / pacing
 const MIN_FRAMES_TO_COMMIT = 6;        // 6 * 20ms = 120ms min audio
@@ -109,6 +109,25 @@ fastify.register(async (fastify) => {
         let collecting = false;
         let silenceTimer = null;        // Timer for silence-based commit
         
+        // Safeguard function to prevent unexpected buffer resets
+        function setAudioBuffer(newValue, reason) {
+            const oldValue = bytesBuffered;
+            console.log('=== AUDIO BUFFER CHANGE ===');
+            console.log('Previous value:', oldValue);
+            console.log('New value:', newValue);
+            console.log('Reason:', reason);
+            console.log('Change amount:', newValue - oldValue);
+            
+            if (oldValue > 0 && newValue === 0 && reason !== 'input_audio_buffer.committed') {
+                console.error('=== WARNING: UNEXPECTED BUFFER RESET ===');
+                console.error('Buffer was reset to 0 for reason:', reason);
+                console.error('This might cause audio processing issues');
+            }
+            
+            bytesBuffered = newValue;
+            console.log('Buffer updated successfully');
+        }
+        
         // Helper: commit audio buffer if we have enough data
         function commitAudioBuffer() {
             if (silenceTimer) {
@@ -152,11 +171,24 @@ fastify.register(async (fastify) => {
                     console.log('=== BUFFER INFO STORED ===');
                     console.log('Buffer info:', bufferInfo);
                     
+                    // CRITICAL: Store the buffer size before sending commit
+                    const bufferSizeBeforeCommit = bytesBuffered;
+                    console.log('=== BUFFER SIZE BEFORE COMMIT ===');
+                    console.log('Stored buffer size:', bufferSizeBeforeCommit);
+                    
                     // Commit the audio buffer
                     openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
                     console.log('=== COMMIT MESSAGE SENT ===');
                     console.log('Commit sent at timestamp:', bufferInfo.timestamp);
                     console.log('Buffer state after sending commit:', bytesBuffered);
+                    
+                    // CRITICAL: Verify buffer is still intact
+                    if (bytesBuffered !== bufferSizeBeforeCommit) {
+                        console.error('=== CRITICAL ERROR: BUFFER MODIFIED AFTER COMMIT ===');
+                        console.error('Buffer size before commit:', bufferSizeBeforeCommit);
+                        console.error('Buffer size after commit:', bytesBuffered);
+                        console.error('Buffer was modified unexpectedly!');
+                    }
                     
                     // CRITICAL: Don't reset buffer yet - wait for OpenAI to confirm commit
                     // Buffer will be reset when we receive input_audio_buffer.committed event
@@ -172,9 +204,10 @@ fastify.register(async (fastify) => {
                     // Only reset on error
                     console.log('=== RESETTING BUFFER DUE TO ERROR ===');
                     console.log('Previous bytesBuffered:', bytesBuffered);
-                    bytesBuffered = 0;
+                    
+                    // Use safeguard function to reset buffer
+                    setAudioBuffer(0, 'commit_error');
                     collecting = false;
-                    console.log('Buffer reset complete - bytesBuffered:', bytesBuffered);
                 }
             } else {
                 console.log('=== SKIPPING COMMIT ===');
@@ -236,6 +269,7 @@ fastify.register(async (fastify) => {
             console.log('Voice ID:', ELEVEN_VOICE_ID);
             console.log('Stream URL:', ELEVEN_STREAM_URL(ELEVEN_VOICE_ID));
             console.log('API Key (first 10 chars):', ELEVEN_API_KEY.substring(0, 10) + '...');
+            console.log('API Key length:', ELEVEN_API_KEY.length);
             
             const elWs = new WebSocket(ELEVEN_STREAM_URL(ELEVEN_VOICE_ID), {
                 headers: { 'xi-api-key': ELEVEN_API_KEY }
@@ -250,15 +284,17 @@ fastify.register(async (fastify) => {
             console.log('Initial WebSocket state:', elWs.readyState);
             console.log('TTS playing set to:', ttsPlaying);
 
-            // Connection timeout
+            // Connection timeout - increased to 15 seconds
             const connectionTimeout = setTimeout(() => {
                 if (elWs.readyState === WebSocket.CONNECTING) {
                     console.error('=== ELEVENLABS CONNECTION TIMEOUT ===');
-                    console.error('Connection took longer than 10 seconds');
+                    console.error('Connection took longer than 15 seconds');
                     console.error('WebSocket state at timeout:', elWs.readyState);
+                    console.error('Voice ID:', ELEVEN_VOICE_ID);
+                    console.error('API Key valid:', ELEVEN_API_KEY.length > 0);
                     elWs.close();
                 }
-            }, 10000); // 10 second timeout
+            }, 15000); // 15 second timeout
 
             // Add connection state logging
             console.log('=== ELEVENLABS CONNECTION STATE TRACKING ===');
@@ -608,9 +644,10 @@ fastify.register(async (fastify) => {
                     console.log('=== RESETTING BUFFER AFTER SUCCESSFUL COMMIT ===');
                     console.log('Previous bytesBuffered:', bytesBuffered);
                     console.log('Buffer reset timestamp:', Date.now());
-                    bytesBuffered = 0;
+                    
+                    // Use safeguard function to reset buffer
+                    setAudioBuffer(0, 'input_audio_buffer.committed');
                     collecting = false;
-                    console.log('Buffer reset complete - bytesBuffered:', bytesBuffered);
                     console.log('Audio buffer reset for next turn');
                 }
                 
@@ -665,15 +702,18 @@ fastify.register(async (fastify) => {
                             
                             const rawLength = Buffer.from(data.media.payload, 'base64').length;
                             const previousBytes = bytesBuffered;
-                            bytesBuffered += rawLength;
+                            const newBytesBuffered = bytesBuffered + rawLength;
                             
                             console.log('=== SENDING AUDIO TO OPENAI ===');
                             console.log('Previous bytes buffered:', previousBytes);
                             console.log('New audio chunk size:', rawLength, 'bytes');
-                            console.log('Updated bytes buffered:', bytesBuffered, 'bytes');
-                            console.log('Total frames collected:', Math.floor(bytesBuffered / FRAME_BYTES));
+                            console.log('Updated bytes buffered:', newBytesBuffered, 'bytes');
+                            console.log('Total frames collected:', Math.floor(newBytesBuffered / FRAME_BYTES));
                             console.log('WebSocket state:', openAiWs.readyState);
                             console.log('OpenAI ready:', openaiReady);
+                            
+                            // Use safeguard function to update buffer
+                            setAudioBuffer(newBytesBuffered, 'audio_chunk_received');
                             
                             try {
                                 openAiWs.send(JSON.stringify(audioAppend));
