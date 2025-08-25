@@ -115,49 +115,87 @@ fastify.register(async (fastify) => {
         return;
       }
 
+      // If something is already speaking, don't overlap
       if (ttsPlaying) return;
 
-      if (elevenWs && elevenWs.readyState === WebSocket.OPEN) {
-        try { elevenWs.close(); } catch {}
-      }
-      elevenWs = new WebSocket(ELEVEN_STREAM_URL(ELEVEN_VOICE_ID), {
+      // Close any previous TTS WS defensively
+      try { if (elevenWs && elevenWs.readyState === WebSocket.OPEN) elevenWs.close(); } catch {}
+      elevenWs = null;
+
+      // Create a new WS and capture it in a local const
+      const elWs = new WebSocket(ELEVEN_STREAM_URL(ELEVEN_VOICE_ID), {
         headers: { 'xi-api-key': ELEVEN_API_KEY }
       });
+
+      // Mark this session as the active one
+      elevenWs = elWs;
       ttsPlaying = true;
       ttsCarry = Buffer.alloc(0);
 
-      elevenWs.on('open', () => {
+      // Helper: check this elWs is still active
+      const isCurrent = () => elevenWs === elWs && ttsPlaying;
+
+      elWs.on('open', () => {
+        // If another TTS session superseded us or barge-in stopped TTS, abort cleanly
+        if (!isCurrent()) { try { elWs.close(); } catch {} return; }
+
         const payload = {
           text,
-          model_id: ELEVEN_MODEL_ID || 'eleven_turbo_v2',
+          // Use your preferred model if you set ELEVEN_MODEL_ID; otherwise default
+          ...(ELEVEN_MODEL_ID ? { model_id: ELEVEN_MODEL_ID } : {}),
           output_format: 'ulaw_8000',
           voice_settings: {
             stability: 0.5,
             similarity_boost: 0.75,
             style: 0.0,
             use_speaker_boost: true
-          }
+          },
+          // Optional: lower latency tuning if supported on your plan
+          optimize_streaming_latency: 3
         };
-        try { elevenWs.send(JSON.stringify(payload)); } catch (e) { console.error('EL send failed', e); stopTTS(); }
+
+        try {
+          // Use the local elWs, not the shared elevenWs
+          elWs.send(JSON.stringify(payload));
+        } catch (e) {
+          console.error('EL send failed on open:', e);
+          try { elWs.close(); } catch {}
+          if (isCurrent()) { ttsPlaying = false; elevenWs = null; }
+        }
       });
 
-      elevenWs.on('message', (chunk) => {
+      elWs.on('message', (chunk) => {
+        // If we're no longer the active session, drop everything
+        if (!isCurrent()) { try { elWs.close(); } catch {}; return; }
+
         if (typeof chunk === 'string') {
           try {
             const msg = JSON.parse(chunk);
-            if (msg.type === 'error') { console.error('ElevenLabs error:', msg); stopTTS(); return; }
-            if (msg.type === 'audio_stream_end') { stopTTS(); return; }
+            if (msg.type === 'error') {
+              console.error('ElevenLabs error:', msg);
+              try { elWs.close(); } catch {}
+              if (isCurrent()) { ttsPlaying = false; elevenWs = null; }
+              return;
+            }
+            if (msg.type === 'audio_stream_end') {
+              try { elWs.close(); } catch {}
+              if (isCurrent()) { ttsPlaying = false; elevenWs = null; }
+              return;
+            }
+            // ignore other JSON keep-alives
             return;
-          } catch { /* ignore non-JSON text */ }
+          } catch {
+            // non-JSON text: ignore
+          }
         }
 
-        // Binary μ-law audio; frame at 20ms (160 bytes)
+        // Binary μ-law @ 8kHz, slice into 20ms (160B) frames and send to Twilio
         const buf = Buffer.from(chunk);
         const { frames, leftover } = sliceIntoUlaw20msFrames(buf, ttsCarry);
         ttsCarry = leftover;
 
         for (const frame of frames) {
-          if (!ttsPlaying || !twilioWs || twilioWs.readyState !== WebSocket.OPEN || !streamSid) break;
+          if (!isCurrent() || !twilioWs || twilioWs.readyState !== WebSocket.OPEN || !streamSid) break;
           try {
             twilioWs.send(JSON.stringify({
               event: 'media',
@@ -166,15 +204,26 @@ fastify.register(async (fastify) => {
             }));
           } catch (e) {
             console.error('Failed to send frame to Twilio:', e);
-            stopTTS();
+            try { elWs.close(); } catch {}
+            if (isCurrent()) { ttsPlaying = false; elevenWs = null; }
             break;
           }
         }
       });
 
-      const cleanup = () => stopTTS();
-      elevenWs.on('close', cleanup);
-      elevenWs.on('error', (e) => { console.error('ElevenLabs WS error:', e.message); cleanup(); });
+      const endSession = () => {
+        if (isCurrent()) { ttsPlaying = false; elevenWs = null; }
+      };
+
+      elWs.on('close', endSession);
+      elWs.on('error', (e) => { console.error('ElevenLabs WS error:', e.message); endSession(); });
+
+      // Optional: guard against "unexpected-response" (bad auth, wrong endpoint, etc.)
+      elWs.on('unexpected-response', (req, res) => {
+        console.error('ElevenLabs unexpected response:', res.statusCode, res.statusMessage);
+        try { elWs.close(); } catch {}
+        endSession();
+      });
     }
 
     function commitAudioBuffer() {
@@ -307,7 +356,10 @@ fastify.register(async (fastify) => {
     twilioWs.on('close', () => {
       if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
       if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-      stopTTS();
+      // Ensure any active TTS session is stopped
+      if (elevenWs && elevenWs.readyState === WebSocket.OPEN) {
+        try { elevenWs.close(); } catch {}
+      }
       console.log('Client disconnected.');
     });
 
