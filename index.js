@@ -158,11 +158,14 @@ fastify.register(async (fastify) => {
                     console.log('Commit sent at timestamp:', bufferInfo.timestamp);
                     console.log('Buffer state after sending commit:', bytesBuffered);
                     
+                    // CRITICAL: Don't reset buffer yet - wait for OpenAI to confirm commit
+                    // Buffer will be reset when we receive input_audio_buffer.committed event
+                    console.log('=== BUFFER PRESERVED FOR OPENAI PROCESSING ===');
+                    console.log('Buffer will be reset after OpenAI confirms commit');
+                    
                     // OpenAI will automatically generate a response
                     console.log('Waiting for OpenAI to generate response...');
                     
-                    // Don't reset buffer yet - wait for OpenAI to confirm commit
-                    // Buffer will be reset when we receive input_audio_buffer.committed event
                 } catch (error) {
                     console.error('=== ERROR COMMITTING AUDIO ===');
                     console.error('Error details:', error);
@@ -496,14 +499,11 @@ fastify.register(async (fastify) => {
                 // Special handling for specific event types
                 if (response.type === 'session.updated') {
                     openaiReady = true;
-                    console.log('=== RESETTING BUFFER FOR NEW SESSION ===');
-                    console.log('Previous bytesBuffered:', bytesBuffered);
-                    bytesBuffered = 0; // Reset audio buffer for new session
-                    collecting = false;
                     console.log('=== SESSION UPDATED ===');
                     console.log('Realtime session configured. You can now forward audio.');
-                    console.log('Audio buffer reset for new session');
                     console.log('Session details:', response);
+                    // NOTE: Don't reset buffer here - let it accumulate for the first audio commit
+                    console.log('Audio buffer preserved for first audio commit');
                 }
                 
                 // Also handle session.created but don't set ready yet - wait for our update
@@ -593,6 +593,7 @@ fastify.register(async (fastify) => {
                     // Now it's safe to reset the buffer for the next turn
                     console.log('=== RESETTING BUFFER AFTER SUCCESSFUL COMMIT ===');
                     console.log('Previous bytesBuffered:', bytesBuffered);
+                    console.log('Buffer reset timestamp:', Date.now());
                     bytesBuffered = 0;
                     collecting = false;
                     console.log('Buffer reset complete - bytesBuffered:', bytesBuffered);
