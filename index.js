@@ -98,6 +98,27 @@ fastify.register(async (fastify) => {
 
     const setAudioBuffer = (v) => { bytesBuffered = v; };
 
+    function commitAudioBuffer() {
+      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+
+      if (!openaiReady || openAiWs.readyState !== WebSocket.OPEN) return;
+      if (bytesBuffered <= 0) return;
+
+      const frames = Math.floor(bytesBuffered / FRAME_BYTES);
+      if (frames < MIN_FRAMES_TO_COMMIT) {
+        console.log(`Skipping commit, only ${frames} frames buffered`);
+        return;
+      }
+
+      try {
+        console.log(`Committing ${frames} frames (${(frames*20)}ms)`);
+        openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+        openAiWs.send(JSON.stringify({ type: 'response.create' }));
+      } catch (e) {
+        console.error('commit/response.create failed:', e);
+      }
+    }
+
     function stopTTS() {
       ttsPlaying = false;
       ttsCarry = Buffer.alloc(0);
@@ -226,20 +247,6 @@ fastify.register(async (fastify) => {
       });
     }
 
-    function commitAudioBuffer() {
-      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-      const frames = Math.floor(bytesBuffered / FRAME_BYTES);
-      if (frames < MIN_FRAMES_TO_COMMIT) return;
-      if (openAiWs.readyState !== WebSocket.OPEN || !openaiReady) return;
-
-      try {
-        openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-        openAiWs.send(JSON.stringify({ type: 'response.create' }));
-      } catch (e) {
-        console.error('commit/response.create failed:', e);
-      }
-    }
-
     const sendSessionUpdate = () => {
       const sessionUpdate = {
         type: 'session.update',
@@ -317,39 +324,56 @@ fastify.register(async (fastify) => {
     twilioWs.on('message', (message) => {
       try {
         const data = JSON.parse(message);
+
         switch (data.event) {
           case 'start':
             streamSid = data.start.streamSid;
             console.log('Incoming stream started', streamSid);
+
+            // fresh call state
+            if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+            setAudioBuffer(0);
+            collecting = false;
+
             tryWelcome();
             break;
 
           case 'media': {
             if (ttsPlaying) stopTTS(); // barge-in
+
             if (openAiWs.readyState === WebSocket.OPEN && openaiReady) {
-              openAiWs.send(JSON.stringify({
-                type: 'input_audio_buffer.append',
-                audio: data.media.payload
-              }));
               const rawLen = Buffer.from(data.media.payload, 'base64').length;
-              if (!collecting) collecting = true;
-              setAudioBuffer(bytesBuffered + rawLen);
-              if (silenceTimer) clearTimeout(silenceTimer);
-              silenceTimer = setTimeout(() => commitAudioBuffer(), SILENCE_MS);
+              if (rawLen > 0) {
+                // send audio to OpenAI
+                openAiWs.send(JSON.stringify({
+                  type: 'input_audio_buffer.append',
+                  audio: data.media.payload
+                }));
+
+                if (!collecting) collecting = true;
+                setAudioBuffer(bytesBuffered + rawLen);
+
+                if (silenceTimer) clearTimeout(silenceTimer);
+                silenceTimer = setTimeout(() => commitAudioBuffer(), SILENCE_MS);
+              }
             }
             break;
           }
 
           case 'stop':
             console.log('Stream stopped');
+            if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+            setAudioBuffer(0);
+            collecting = false;
+            try { if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close(); } catch {}
             break;
 
           default:
-            // 'connected', etc.
+            // ignore other Twilio events
             break;
         }
       } catch (e) {
-        console.error('Error parsing Twilio msg:', e);
+        console.error('Error parsing Twilio msg:', e, 'Raw:', message);
       }
     });
 
